@@ -1,0 +1,147 @@
+trigger:
+  - main
+  - feature/*
+
+# Define global variables that can be overridden
+variables:
+  - group: azure-deployment-settings
+  - name: resourceGroupName
+    value: 'myapp-rg-$(environment)'
+  - name: location
+    value: 'eastus2'
+  - name: environment
+    value: 'dev'
+  - name: vmImage
+    value: 'ubuntu-latest'
+  - name: dotnetVersion
+    value: '7.0.x'
+
+# Stages configuration
+stages:
+- stage: Validate
+  jobs:
+  - job: ValidateBicepTemplates
+    pool:
+      vmImage: ${{ variables.vmImage }}
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Validate Bicep Templates'
+      inputs:
+        azureSubscription: 'Azure-Subscription'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az bicep build --file infra/main.bicep
+          az deployment sub what-if \
+            --location ${{ variables.location }} \
+            --template-file infra/main.bicep \
+            --parameters environment=${{ variables.environment }}
+
+# - stage: DeployInfrastructure
+#   jobs:
+#   - job: DeployAzureResources
+#     pool:
+#       vmImage: ${{ variables.vmImage }}
+#     steps:
+#     - task: AzureCLI@2
+#       displayName: 'Create Resource Group'
+#       inputs:
+#         azureSubscription: 'Azure-Subscription'
+#         scriptType: 'bash'
+#         scriptLocation: 'inlineScript'
+#         inlineScript: |
+#           az group create \
+#             --name ${{ variables.resourceGroupName }} \
+#             --location ${{ variables.location }}
+
+    - task: AzureCLI@2
+      displayName: 'Deploy Bicep Infrastructure'
+      inputs:
+        azureSubscription: 'Azure-Subscription'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az deployment group create \
+            --resource-group ${{ variables.resourceGroupName }} \
+            --template-file infra/main.bicep \
+            --parameters \
+              infra/main.parameters.json \
+              primaryLocation=${{ variables.location }} \
+              sqlAdminUsername=$(sqlAdminUsername) \
+              sqlAdminPassword=$(sqlAdminPassword) \
+              alertEmail=$(alertEmail)
+
+- stage: BuildAndDeploy
+  jobs:
+  - job: BuildWebApp
+    pool:
+      vmImage: ${{ variables.vmImage }}
+    steps:
+    - task: UseDotNet@2
+      displayName: 'Use .NET $(dotnetVersion)'
+      inputs:
+        version: ${{ variables.dotnetVersion }}
+        
+    - task: DotNetCoreCLI@2
+      displayName: 'Restore Dependencies'
+      inputs:
+        command: 'restore'
+        projects: '**/*.csproj'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Build Solution'
+      inputs:
+        command: 'build'
+        projects: '**/*.csproj'
+        arguments: '--configuration Release'
+
+    # - task: DotNetCoreCLI@2
+    #   displayName: 'Run Unit Tests'
+    #   inputs:
+    #     command: 'test'
+    #     projects: '**/*Tests/*.csproj'
+    #     arguments: '--configuration Release'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Publish Web App'
+      inputs:
+        command: 'publish'
+        publishWebProjects: true
+        arguments: '--configuration Release --output $(Build.ArtifactStagingDirectory)'
+        
+    - publish: $(Build.ArtifactStagingDirectory)
+      artifact: webapp
+      displayName: 'Publish Artifact'
+
+  - deployment: DeployToAppService
+    dependsOn: BuildWebApp
+    pool:
+      vmImage: ${{ variables.vmImage }}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureWebApp@1
+            displayName: 'Deploy Web App'
+            inputs:
+              azureSubscription: 'Azure-Subscription'
+              appName: '$(webAppName)'  # Retrieved from Bicep output
+              package: '$(Pipeline.Workspace)/webapp/**/*.zip'
+              
+# Optional: Add health check and smoke test stage
+- stage: SmokeTest
+  jobs:
+  - job: HealthCheck
+    pool:
+      vmImage: ${{ variables.vmImage }}
+    steps:
+    - task: PowerShell@2
+      displayName: 'Perform Health Check'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $response = Invoke-WebRequest -Uri "$(webAppUrl)/health" -Method Get
+          if ($response.StatusCode -ne 200) {
+            Write-Error "Health check failed"
+            exit 1
+          }
